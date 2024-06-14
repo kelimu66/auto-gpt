@@ -168,9 +168,9 @@ OPEN_AI_CHAT_MODELS = {
         ChatModelInfo(
             name=OpenAIModelName.GPT4_O,
             provider_name=ModelProviderName.OPENAI,
-            prompt_token_cost=5 / 1_000_000,
-            completion_token_cost=15 / 1_000_000,
-            max_tokens=128_000,
+            prompt_token_cost=0.005 / 1000,
+            completion_token_cost=0.015 / 1000,
+            max_tokens=128000,
             has_function_call_api=True,
         ),
     ]
@@ -323,6 +323,14 @@ class OpenAIProvider(
 
         if self._credentials.api_type == SecretStr("azure"):
             from openai import AsyncAzureOpenAI
+            
+            from autogpt.config import (
+                ConfigBuilder,
+            )
+            # Set up configuration
+            config = ConfigBuilder.build_config_from_env()
+            self._credentials.load_azure_config(config.azure_config_file)
+            # print('self._credentials  ',self._credentials)
 
             # API key and org (if configured) are passed, the rest of the required
             # credentials is loaded from the environment by the AzureOpenAI client.
