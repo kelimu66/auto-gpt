@@ -1,5 +1,5 @@
 "use client";
-import React, { useState, useCallback, useEffect, useMemo } from 'react';
+import React, { useState, useCallback, useEffect, useMemo, useRef } from 'react';
 import ReactFlow, {
   addEdge,
   useNodesState,
@@ -21,9 +21,13 @@ import { Input } from './ui/input';
 import { ChevronRight, ChevronLeft } from "lucide-react";
 import { deepEquals, getTypeColor } from '@/lib/utils';
 import { beautifyString } from '@/lib/utils';
+import { history } from './history';
 import { CustomEdge, CustomEdgeData } from './CustomEdge';
 import ConnectionLine from './ConnectionLine';
 
+// This is for the history, this is the minimum distance a block must move before it is logged
+// It helps to prevent spamming the history with small movements especially when pressing on a input in a block
+const MINIMUM_MOVE_BEFORE_LOG = 50;
 
 type CustomNodeData = {
   blockType: string;
@@ -87,6 +91,8 @@ const FlowEditor: React.FC<{
 
   const apiUrl = process.env.AGPT_SERVER_URL!;
   const api = useMemo(() => new AutoGPTServerAPI(apiUrl), [apiUrl]);
+  const initialPositionRef = useRef<{ [key: string]: { x: number; y: number } }>({});
+  const isDragging = useRef(false);
 
   useEffect(() => {
     api.connectWebSocket()
@@ -119,8 +125,160 @@ const FlowEditor: React.FC<{
       .then(graph => loadGraph(graph));
   }, [flowID, template, availableNodes]);
 
+  useEffect(() => {
+    const handleKeyDown = (event: KeyboardEvent) => {
+      const isMac = navigator.platform.toUpperCase().indexOf('MAC') >= 0;
+      const isUndo = (isMac ? event.metaKey : event.ctrlKey) && event.key === 'z';
+      const isRedo = (isMac ? event.metaKey : event.ctrlKey) && event.key === 'y';
+  
+      if (isUndo) {
+        event.preventDefault();
+        handleUndo();
+      }
+  
+      if (isRedo) {
+        event.preventDefault();
+        handleRedo();
+      }
+    };
+  
+    window.addEventListener('keydown', handleKeyDown);
+  
+    return () => {
+      window.removeEventListener('keydown', handleKeyDown);
+    };
+  }, []);
+
   const nodeTypes: NodeTypes = useMemo(() => ({ custom: CustomNode }), []);
   const edgeTypes: EdgeTypes = useMemo(() => ({ custom: CustomEdge }), []);
+
+  const onNodesChange: OnNodesChange = useCallback(
+    (changes) => {
+      changes.forEach(change => {
+        if (change.type === 'remove') {
+          const removedNode = nodes.find(node => node.id === change.id);
+          if (removedNode) {
+            history.push({
+              type: 'DELETE_NODE',
+              payload: removedNode,
+              undo: () => setNodes((nds) => [...nds, removedNode]),
+              redo: () => setNodes((nds) => nds.filter(node => node.id !== removedNode.id))
+            });
+          }
+        } else if (change.type === 'position' && !isDragging.current) {
+          const movedNode = nodes.find(node => node.id === change.id);
+          if (movedNode) {
+            const oldPosition = initialPositionRef.current[change.id] || movedNode.position;
+            const newPosition = change.position;
+            
+            // Calculate the movement distance
+            const distanceMoved = Math.sqrt(
+              Math.pow(newPosition.x - oldPosition.x, 2) +
+              Math.pow(newPosition.y - oldPosition.y, 2)
+            );
+
+            if (distanceMoved > MINIMUM_MOVE_BEFORE_LOG) { // Minimum movement threshold
+              history.push({
+                type: 'UPDATE_NODE_POSITION',
+                payload: { nodeId: change.id, oldPosition, newPosition },
+                undo: () => setNodes((nds) => nds.map(node => node.id === change.id ? { ...node, position: oldPosition } : node)),
+                redo: () => setNodes((nds) => nds.map(node => node.id === change.id ? { ...node, position: newPosition } : node)),
+              });
+              initialPositionRef.current[change.id] = newPosition;
+            }
+          }
+        }
+      });
+      setNodes((nds) => applyNodeChanges(changes, nds));
+    },
+    [nodes]
+  );
+
+  const onNodesChangeStart = (event: MouseEvent, node: Node) => {
+    initialPositionRef.current[node.id] = { ...node.position };
+    isDragging.current = true;
+  };
+
+  const onNodesChangeEnd = (event: MouseEvent, node: Node | null) => {
+    if (!node) return;
+  
+    isDragging.current = false;
+    const oldPosition = initialPositionRef.current[node.id];
+    const newPosition = node.position;
+
+    // Calculate the movement distance
+    if (!oldPosition || !newPosition) return;
+
+    const distanceMoved = Math.sqrt(
+      Math.pow(newPosition.x - oldPosition.x, 2) +
+      Math.pow(newPosition.y - oldPosition.y, 2)
+    );
+
+    if (distanceMoved > MINIMUM_MOVE_BEFORE_LOG) { // Minimum movement threshold
+      history.push({
+        type: 'UPDATE_NODE_POSITION',
+        payload: { nodeId: node.id, oldPosition, newPosition },
+        undo: () => setNodes((nds) => nds.map(n => n.id === node.id ? { ...n, position: oldPosition } : n)),
+        redo: () => setNodes((nds) => nds.map(n => n.id === node.id ? { ...n, position: newPosition } : n)),
+      });
+    }
+    delete initialPositionRef.current[node.id];
+  };
+
+  const onEdgesChange: OnEdgesChange = useCallback(
+    (changes) => {
+      changes.forEach(change => {
+        if (change.type === 'remove') {
+          const removedEdge = edges.find(edge => edge.id === change.id);
+          if (removedEdge) {
+            history.push({
+              type: 'DELETE_EDGE',
+              payload: removedEdge,
+              undo: () => setEdges((eds) => [...eds, removedEdge]),
+              redo: () => {
+                setEdges((eds) => addEdge(removedEdge, eds));
+                updateNodesOnEdgeChange(removedEdge, 'add');
+              }
+            });
+            updateNodesOnEdgeChange(removedEdge, 'remove');
+          }
+        }
+      });
+      setEdges((eds) => applyEdgeChanges(changes, eds));
+    },
+    [edges]
+  );
+
+  const updateNodesOnEdgeChange = (edge: Edge<CustomEdgeData>, action: 'add' | 'remove') => {
+    setNodes((nds) =>
+      nds.map((node) => {
+        if (node.id === edge.source || node.id === edge.target) {
+          const connections = action === 'add'
+            ? [
+                ...node.data.connections,
+                {
+                  source: edge.source,
+                  sourceHandle: edge.sourceHandle!,
+                  target: edge.target,
+                  targetHandle: edge.targetHandle!,
+                }
+              ]
+            : node.data.connections.filter(
+                (conn) =>
+                  !(conn.source === edge.source && conn.target === edge.target && conn.sourceHandle === edge.sourceHandle && conn.targetHandle === edge.targetHandle)
+              );
+          return {
+            ...node,
+            data: {
+              ...node.data,
+              connections,
+            },
+          };
+        }
+        return node;
+      })
+    );
+  };
 
   const getOutputType = (id: string, handleId: string) => {
     const node = nodes.find((node) => node.id === id);
@@ -140,39 +298,61 @@ const FlowEditor: React.FC<{
     return node.position;
   }
 
-  const onConnect: OnConnect = (connection: Connection) => {
-    const edgeColor = getTypeColor(getOutputType(connection.source!, connection.sourceHandle!));
-    const sourcePos = getNodePos(connection.source!)
-    console.log('sourcePos', sourcePos);
-    setEdges((eds) => addEdge({
-      type: 'custom',
-      markerEnd: { type: MarkerType.ArrowClosed, strokeWidth: 2, color: edgeColor },
-      data: { edgeColor, sourcePos },
-      ...connection
-    }, eds));
-    setNodes((nds) =>
-      nds.map((node) => {
-        if (node.id === connection.target || node.id === connection.source) {
-          return {
-            ...node,
-            data: {
-              ...node.data,
-              connections: [
-                ...node.data.connections,
-                {
-                  source: connection.source,
-                  sourceHandle: connection.sourceHandle,
-                  target: connection.target,
-                  targetHandle: connection.targetHandle,
-                } as { source: string; sourceHandle: string; target: string; targetHandle: string },
-              ],
-            },
-          };
-        }
-        return node;
-      })
-    );
-  }
+  const onConnect: OnConnect = useCallback(
+    (connection: Connection) => {
+      const edgeColor = getTypeColor(getOutputType(connection.source!, connection.sourceHandle!));
+      const sourcePos = getNodePos(connection.source!)
+      console.log('sourcePos', sourcePos);
+      const newEdge = {
+        id: `${connection.source}_${connection.sourceHandle}_${connection.target}_${connection.targetHandle}`,
+        type: 'custom',
+        markerEnd: { type: MarkerType.ArrowClosed, strokeWidth: 2, color: edgeColor },
+        data: { edgeColor, sourcePos },
+        ...connection
+      };
+  
+      setEdges((eds) => {
+        const newEdges = addEdge(newEdge, eds);
+        history.push({
+          type: 'ADD_EDGE',
+          payload: newEdge,
+          undo: () => {
+            setEdges((prevEdges) => prevEdges.filter(edge => edge.id !== newEdge.id));
+            updateNodesOnEdgeChange(newEdge, 'remove');
+          },
+          redo: () => {
+            setEdges((prevEdges) => addEdge(newEdge, prevEdges));
+            updateNodesOnEdgeChange(newEdge, 'add');
+          }
+        });
+        updateNodesOnEdgeChange(newEdge, 'add');
+        return newEdges;
+      });
+      setNodes((nds) =>
+        nds.map((node) => {
+          if (node.id === connection.target || node.id === connection.source) {
+            return {
+              ...node,
+              data: {
+                ...node.data,
+                connections: [
+                  ...node.data.connections,
+                  {
+                    source: connection.source,
+                    sourceHandle: connection.sourceHandle,
+                    target: connection.target,
+                    targetHandle: connection.targetHandle,
+                  } as { source: string; sourceHandle: string; target: string; targetHandle: string },
+                ],
+              },
+            };
+          }
+          return node;
+        })
+      );
+    },
+    [nodes]
+  );
 
   const onEdgesDelete = useCallback(
     (edgesToDelete: Edge<CustomEdgeData>[]) => {
@@ -187,8 +367,8 @@ const FlowEditor: React.FC<{
                   (edge) =>
                     edge.source === conn.source &&
                     edge.target === conn.target &&
-                    edge.sourceHandle === conn.sourceHandle &&
-                    edge.targetHandle === conn.targetHandle
+                    edge.sourceHandle === edge.sourceHandle &&
+                    edge.targetHandle === edge.targetHandle
                 )
             ),
           },
@@ -216,11 +396,11 @@ const FlowEditor: React.FC<{
         outputSchema: nodeSchema.outputSchema,
         hardcodedValues: {},
         setHardcodedValues: (values: { [key: string]: any }) => {
-          setNodes((nds) => nds.map((node) =>
-            node.id === newNode.id
-              ? { ...node, data: { ...node.data, hardcodedValues: values } }
-              : node
-          ));
+          setNodes((nds) =>
+            nds.map((node) =>
+              node.id === newNode.id ? { ...node, data: { ...node.data, hardcodedValues: values } } : node
+            )
+          );
         },
         connections: [],
         isOutputOpen: false,
@@ -230,6 +410,21 @@ const FlowEditor: React.FC<{
 
     setNodes((nds) => [...nds, newNode]);
     setNodeId((prevId) => prevId + 1);
+
+    history.push({
+      type: 'ADD_NODE',
+      payload: newNode,
+      undo: () => setNodes((nds) => nds.filter(node => node.id !== newNode.id)),
+      redo: () => setNodes((nds) => [...nds, newNode])
+    });
+  };
+
+  const handleUndo = () => {
+    history.undo();
+  };
+  
+  const handleRedo = () => {
+    history.redo();
   };
 
   function loadGraph(graph: Graph) {
@@ -552,6 +747,8 @@ const FlowEditor: React.FC<{
         connectionLineComponent={ConnectionLine}
         onEdgesDelete={onEdgesDelete}
         deleteKeyCode={["Backspace", "Delete"]}
+        onNodeDragStart={onNodesChangeStart}
+        onNodeDragStop={onNodesChangeEnd}
       >
         <div style={{ position: 'absolute', right: 10, zIndex: 4 }}>
           <Input
@@ -576,6 +773,10 @@ const FlowEditor: React.FC<{
             {!savedAgent &&
               <Button onClick={() => saveAgent(true)}>Save as Template</Button>
             }
+            <div>
+              <Button onClick={handleUndo} disabled={!history.canUndo()}>Undo</Button>
+              <Button onClick={handleRedo} disabled={!history.canRedo()}>Redo</Button>
+            </div>
           </div>
         </div>
       </ReactFlow>
