@@ -4,11 +4,11 @@ import {
   TooltipProvider,
   TooltipTrigger,
 } from "@/components/ui/tooltip"
-import { BlockSchema } from "@/lib/types";
+import { BlockIOSubSchema } from "@/lib/autogpt-server-api/types";
 import { Info } from 'lucide-react';
 import ReactMarkdown from 'react-markdown';
 
-const SchemaTooltip: React.FC<{ schema: BlockSchema }> = ({ schema }) => {
+const SchemaTooltip: React.FC<{ schema: BlockIOSubSchema }> = ({ schema }) => {
   if (!schema.description) return null;
 
   return (
